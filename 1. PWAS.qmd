@@ -1,0 +1,592 @@
+---
+title: "Section1: protein-wide association"
+author: "Meizhen"
+date: "`r Sys.Date()`"
+abstract: |
+  Examine pairwise associations between exposures and protein modules using linear regression, and 
+  1. Not applied inverse probability weighting to account for the nested case–control sampling;
+  2. Calculated BY FDR-adjusted p-values for multiple testing correction.
+format: 
+  html:
+    self-contained: true  # Ensures a single HTML file is created
+    code-fold: true
+    toc: true
+    toc-location: left
+theme: united
+number-sections: true
+editor: visual
+fig-width: 18
+fig-height: 12
+execute: 
+  warning: false
+---
+
+```{r, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(data.table)
+library(readr)
+library(readxl)
+library(formattable)
+library(OlinkAnalyze)
+library(gtsummary)
+library(flextable)
+library(pheatmap)
+library(plotly)
+library(gapminder)
+library(manipulateWidget)
+library(ggfortify)
+library(ggplotify)
+library(reactable)
+library(mice)
+library(naniar)
+library(ggrepel)
+library(writexl)
+library(plotly)
+library(OlinkAnalyze)
+library(clusterProfiler)
+library(ReactomePA)
+library(enrichplot)
+library(fgsea)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(mixOmics)
+library(ComplexHeatmap)
+library(UpSetR)
+library(qvalue)
+
+setwd("/Users/meizhenyao/Documents/projects/proteomics_ht/data")
+
+data <- fread("intermediate/whole_inverserank_data.txt")
+assay_list<- read_excel("raw/proteins/olink-explore-ht-assay-list.xlsx")
+names(assay_list)[1]<- "OlinkID"
+names(assay_list)[2]<- "UniProt_ID"
+names(assay_list)[3]<- "Protein_name"
+names(assay_list)[4]<- "Gene_name"
+
+
+## Proteins with <LOD% > 75%
+protein_lod_remove75<- fread("intermediate/protein_lod_remove75.txt")$Assay
+OlinkID_lod_remove75<- fread("intermediate/protein_lod_remove75.txt")$OlinkID
+
+chemical_name <- names(data %>% 
+                       dplyr::select(starts_with("pfas_"), starts_with("pth_") , starts_with("pah_") , starts_with("parab_") , starts_with("bis_") , starts_with("metal_") , -ends_with("_blod") ) )
+
+
+data_ready<-  data %>% 
+  mutate(ptb_type = case_when(ptb == 0 ~ "Not preterm birth",
+                              ptb == 1 & ptb_spont == 1 ~ "Spontaneous preterm birth",
+                              ptb == 1 & ptb_placental == 1 ~ "Placental preterm birth",
+                              ptb == 1 & ptb_protocol == 1 ~ "Protocol preterm birth"),
+         ptb_cat = factor(ptb, levels = c(0,1), labels = c("No", "Yes")),
+         hispanic = factor(hispanic, levels = c(0,1), labels = c("No", "Yes")),
+         race_recat = factor(ifelse(race == "Caucasian", "Caucasian", "Non-Caucasian"), levels = c("Caucasian", "Non-Caucasian")),
+         parity_recat = factor(case_when(parity == 0 ~ "0",
+                                         parity == 1 ~ "1",
+                                         .default = ">1"), levels = c("0", "1", ">1"))) %>% 
+        mutate(across(chemical_name, ~(log2(.x)), .names = '{col}_l'),
+               weight = ifelse(ptb == 1, 1/(43/143), 1/(43/1038)))
+
+
+
+#### long format
+
+# protein_long <- fread("intermediate/proteome_long.txt")
+```
+
+```{r, warning=FALSE, message=FALSE}
+sample_size<- c("86")
+protein<- c(2975)
+visit<- c("Pregnancy visit3")
+GA<- c("24")
+
+data<- data.frame(sample_size,
+                  protein,
+                  visit,
+                  GA)
+flextable(data) %>% 
+  add_header_row(values="Proteome overview", colwidths = 4) %>% 
+  theme_vanilla() %>% 
+  set_table_properties(layout = "autofit")
+
+```
+
+# Part 1: pair-wise differential analyses & enrichment analyses
+
+## Regression
+
+### GM
+
+#### Figure 1
+
+```{r, warning=FALSE, message=FALSE}
+
+
+setwd("/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/paper1")
+
+# List all CSV files ending with "_noweight_sva.csv"
+files <- list.files(pattern = "pth_gm_ad_noweight_robust\\.csv$")
+
+# Read and combine all files
+proteome_raw <- do.call(rbind, lapply(files, read.csv))
+
+
+names(assay_list)[1]<- "Outcome"         
+
+# restricted to proteins with good detection rate
+model_fit<- proteome_raw %>% 
+            filter(!Outcome %in% OlinkID_lod_remove75 & !Exposure %in% c("pth_dehp_SG_gm_l")) %>% 
+            left_join(assay_list, by = "Outcome") %>% 
+            mutate(fdr_all = fdr_by_single) %>% 
+            arrange(desc(p.value))
+
+p_correct<- (model_fit %>% 
+        filter(fdr_all>0.1) %>% 
+         arrange(p.value)%>% 
+        slice_head(n=1))$p.value
+  
+  # (((model_fit %>% 
+  #       filter(fdr_all<0.1) %>% 
+  #       slice_head(n=1))$p.value) + ((model_fit %>% 
+  #       filter(fdr_all>0.1) %>% 
+  #        arrange(p.value)%>% 
+  #       slice_head(n=1))$p.value))/2
+
+
+# p_correct_by<- (model_fit %>% 
+#         filter(fdr_by>0.1) %>% 
+#          arrange(p.value)%>% 
+#         slice_head(n=1))$p.value
+  
+  
+  # (((model_fit %>% 
+  #       filter(fdr_by<0.1) %>% 
+  #       slice_head(n=1))$p.value) + ((model_fit %>% 
+  #       filter(fdr_by>0.1) %>% 
+  #        arrange(p.value)%>% 
+  #       slice_head(n=1))$p.value))/2
+
+
+order<- model_fit %>% 
+  filter(p.value < 0.05) %>% 
+  group_by(Exposure) %>% 
+  summarize(seq = n()) %>% 
+  arrange(desc(seq))
+
+model_fit$Exposure <- factor(model_fit$Exposure,
+                             levels = order$Exposure,
+                             labels = toupper(gsub("_SG_gm_l","",gsub("pth_", "", order$Exposure))))
+
+exposure_labels <- levels(model_fit$Exposure)
+
+
+
+model_fit$Association <- "Raw p.value > 0.05"
+model_fit$Association[model_fit$p.value < 0.05] <- "Raw p.value < 0.05"
+model_fit$Association[model_fit$Value > 0 & model_fit$fdr_all < 0.1] <- "Positive significant\n(FDR<0.1)"
+model_fit$Association[model_fit$Value < 0 & model_fit$fdr_all < 0.1] <- "Negative significant\n(FDR<0.1)"
+
+model_fit$Association<- factor(model_fit$Association,
+                               levels = c("Positive significant\n(FDR<0.1)", "Negative significant\n(FDR<0.1)", "Raw p.value < 0.05", "Raw p.value > 0.05"))
+
+
+# Apply jittering to the numeric exposure variable
+set.seed(3215)  # Ensures reproducibility
+model_fit <- model_fit %>%
+  mutate(Exposure_numeric = as.numeric(Exposure),
+         Exposure_jittered = jitter(Exposure_numeric, amount = 0.4),
+         direction = ifelse(Value > 0, 1, -1),
+         p.value_direction = -log10(p.value)*direction)
+
+# Select significant points and use the same jittered positions
+model_fit_sig_pos <- model_fit %>%
+  filter(Gene_name %in% model_fit$Gene_name& Value > 0)  %>%  # Ensure correct matching
+  arrange(p.value) %>%
+  slice_head(n=30)
+
+model_fit_sig_neg <- model_fit %>%
+  filter(Gene_name %in% model_fit$Gene_name & Value < 0) %>%  # Ensure correct matching
+  arrange(p.value) %>%
+  slice_head(n=5)
+
+model_fit_sig<- rbind(model_fit_sig_pos, model_fit_sig_neg)
+model_fit_sig_olink<- model_fit_sig$Outcome
+
+# Use the jittered numeric exposure for plotting
+manhplot<- ggplot(model_fit, aes(x = Exposure_jittered, y = p.value_direction, color = Association)) +
+            # Plot points using jittered exposure
+            geom_point(alpha = 0.8, size = 3) +
+            geom_hline(yintercept = 0, linewidth = 1.2, color = "black", linetype = "solid") + 
+            # Labels with exact same jittered positions
+            geom_label_repel(data = model_fit_sig,
+                             aes(x = Exposure_jittered, y = p.value_direction, label = Gene_name),
+                             size = 6,
+                             box.padding = unit(0.3, "lines"),
+                             point.padding = unit(0.2, "lines"),
+                                       max.overlaps = getOption("ggrepel.max.overlaps", default = 200),
+                             force = 5,  # Adjust force to improve alignment
+                             force_pull = 5,  # Keep label close to its point
+                             show.legend = FALSE) +
+            scale_color_manual(values = c("Raw p.value > 0.05" = "grey",
+                                          "Raw p.value < 0.05" = "black",
+                                          "Negative significant\n(FDR<0.1)" = "blue", 
+                                          "Positive significant\n(FDR<0.1)" = "#BD260B")) +
+            # Correct X-axis labels by mapping numeric values back to original category names
+            scale_x_continuous(breaks = seq_along(exposure_labels), labels = exposure_labels) +
+            scale_y_continuous(breaks = seq(floor(min(model_fit$p.value_direction)), ceiling(max(model_fit$p.value_direction)), by = 2))+
+            coord_cartesian(clip = "off") +  
+            labs(x = NULL,
+                 y= "-log10(p.value)*direction") + 
+            theme_classic() +
+            theme( 
+              legend.title = element_text(size = 15, face = "bold"),
+              legend.text = element_text(size = 15, face = "bold"),
+              plot.title = element_text(size = 22, face = "bold"),
+              axis.text.x = element_text(size = 15, face = "bold"),
+              axis.text.y = element_text(size = 22, face = "bold"),
+              axis.title = element_text(size = 22, face = "bold"),
+              strip.background = element_blank(),
+              strip.text.x = element_text(colour = "black", face = "bold", size = 18)
+            )
+
+manhplot
+
+
+model_fit %>%
+ filter(fdr_all<0.1) %>% 
+   mutate(Direction = ifelse(Value<0, "-", "+"),
+          p.value = round(p.value, 7),
+          fdr_all = round(fdr_all, 7)) %>% 
+   dplyr::select(Exposure, Protein_name, Gene_name, Direction, p.value, fdr_all) %>% 
+   group_by(Exposure) %>% 
+   arrange(by_group = Exposure) %>% 
+   reactable(groupBy = "Exposure",              filterable = TRUE)
+
+
+
+sig_results_gm<-  model_fit %>%
+                  filter(fdr_all<0.1) 
+
+
+```
+
+```{r}
+
+# choose identifier and alpha
+id_var <- "Protein_name"   # or "UniProt_ID"
+alpha  <- 0.05             # or use your BY adjusted column
+
+# 1) significant proteins per exposure
+sig <- model_fit %>%
+  filter(p.value < alpha) %>%              # replace with fdr or BY column if desired
+  dplyr::select(Exposure, all_of(id_var)) %>%
+  distinct()
+
+# 2) build a list: one character vector per exposure
+sets_list <- split(sig[[id_var]], sig$Exposure)
+sets_list <- lapply(sets_list, unique)
+
+# remove sets with no overlap (unique proteins only)
+sets_list <- sets_list[sapply(sets_list, function(x)
+  any(sapply(sets_list, function(y) length(intersect(x, y))) > 0) &
+        length(x) > 0)]
+
+# make UpSet plot
+m <- make_comb_mat(sets_list)
+# keep top 10 intersections
+idx    <- head(order(comb_size(m), decreasing = TRUE), 10)
+top_m  <- m[idx]
+
+set.seed(20251105)
+# plot using the already-ordered object
+upset <- UpSet(
+  top_m,
+  top_annotation = HeatmapAnnotation(
+    Degree = as.character(comb_degree(top_m)),
+    "Intersection\nsize" = anno_barplot(
+      comb_size(top_m),
+      border = FALSE,
+      gp = gpar(fill = "black"),
+      height = unit(2, "cm")
+    ),
+    annotation_name_side = "left",
+    annotation_name_rot = 0
+  ),
+  right_annotation = upset_right_annotation(top_m),
+  row_names_gp = gpar(fontsize = 15, fontface = "bold"),       # row (set) label size
+  column_names_gp = gpar(fontsize = 15),    # column (intersection) label size
+  pt_size = unit(4, "mm")                   # make dots larger
+)
+
+g_up <- as.ggplot(function() draw(upset, newpage = FALSE))
+```
+
+```{r}
+
+setwd("/Users/meizhenyao/Documents/projects/proteomics_ht/result/paper1")
+
+jpeg(filename = "Figure1.jpg", width = 17, height = 17, units = "in", res = 300)
+
+ggarrange(manhplot, g_up,
+          nrow=2, ncol = 1, 
+          heights = c(1, 0.8), 
+          labels = c("A", "B"),
+          font.label = list(size = 20, color = "black", face = "bold", family = NULL)  
+          )
+
+dev.off()
+```
+
+#### Table 3
+
+```{r}
+sig_results_gm<-  model_fit %>%
+                  filter(fdr_all<0.1) 
+
+
+model_fit2<-  sig_results_gm %>% 
+              mutate(Estimate = formatC(Value, format = "f", digits = 2),
+                     Low = formatC(Lower.limit, format = "f", digits = 2),
+                     High = formatC(Upper.limit, format = "f", digits = 2),
+                     p.value = formatC(p.value, format = "f", digits = 2),
+                     `95%CI` = paste0("(", Low, ", ", High, ")")) %>% 
+              dplyr::select(Exposure, Gene_name, Protein_name, Estimate, `95%CI`) %>% 
+              arrange(Exposure)
+
+table<- flextable(model_fit2) %>%
+    theme_box() %>%  
+    merge_v(j = c("Exposure")) %>%  # Merge vertically to remove duplicates
+    bold(part = "header") %>%  
+    align(align = "center", part = "all") %>%  
+    autofit()  
+table
+
+```
+
+## Pathway
+
+### Reactome
+
+#### Figure 2
+
+##### Only positive signals
+
+```{r, warning=FALSE, message=FALSE}
+
+
+top_mapping<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/pathway/top_mapping.xlsx")
+
+path<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/paper1/reactome_pos_gm.xlsx")
+
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(forcats)
+
+path2 <- path %>% 
+  filter(p.adjust < 0.05 & !exposure == "DEHP") %>% 
+  inner_join(top_mapping, by = "ID") %>%
+  mutate(
+    Pathway   = str_wrap(Description, width = 50),
+    FDR       = p.adjust,
+    exposure  = factor(exposure,
+                       levels = c("MECPP","MEOHP","MBZP",
+                                  "MEHHP","MEHP","MCPP","MEP","MIBP","MBP")),
+    top_lab   = str_wrap(coalesce(top_name, top_pathway), width = 20)
+  ) %>%
+  group_by(top_lab) %>%
+  mutate(Pathway_ord = fct_reorder(Pathway, FDR, .fun = min, .desc = TRUE)) %>%
+  ungroup()
+
+
+
+gp_pos<- ggplot(path2, aes(x = exposure, y = Pathway_ord)) +
+  facet_grid(top_lab ~ ., scales = "free_y", space = "free_y") +   # no switch = "y"
+  geom_point(aes(color = FDR, size = Count), alpha = 1) +
+  scale_color_gradient(low = "#BD260B", high = "pink") +
+  scale_size(range = c(2, 8),
+  breaks = c(10, 50, 90, 140))  +  # only integers will show  +    # increase both min and max sizes
+
+  ylab("") +
+  xlab("") +
+  theme_bw() +
+  theme(
+    # use strip text to show top pathway, on the right (default for row facets)
+    strip.text.y = element_text(size = 14, face = "bold", angle = 0),
+    strip.background = element_rect(
+    fill = "white",
+    colour = "black"      
+  ),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text  = element_text(size = 11),
+    axis.text.x  = element_text(size = 14, face = "bold"),
+    axis.text.y  = element_text(size = 14, face = "bold"),
+    axis.title   = element_text(size = 14, face = "bold"),
+    legend.position = "right",
+    legend.background = element_rect(
+      size = 0.5, linetype = "solid", colour = "#BD260B"
+    ),
+    plot.margin = unit(c(0.5, 0.5, 1, 0.5), "cm")
+  ) +
+  guides(
+    color = guide_colorbar(order = 1),
+    size  = guide_legend(order = 2)
+  )
+gp_pos
+```
+
+##### Only negative signals
+
+```{r, warning=FALSE, message=FALSE}
+
+
+top_mapping<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/pathway/top_mapping.xlsx")
+path<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/paper1/reactome_neg_gm.xlsx")
+
+
+
+path2 <- path %>% 
+  filter(p.adjust < 0.05 & !exposure == "DEHP") %>% 
+  inner_join(top_mapping, by = "ID") %>%
+  mutate(
+    Pathway   = str_wrap(Description, width = 50),
+    FDR       = p.adjust,
+    exposure  = factor(exposure,
+                       levels = c("MECPP","DEHP","MEOHP","MBZP",
+                                  "MEHHP","MEHP","MCPP","MEP","MIBP","MBP")),
+    top_lab   = str_wrap(coalesce(top_name, top_pathway), width = 20)
+  ) %>%
+  group_by(top_lab) %>%
+  mutate(Pathway_ord = fct_reorder(Pathway, FDR, .fun = min, .desc = TRUE)) %>%
+  ungroup()
+
+
+
+
+gp_neg<- ggplot(path2, aes(x = exposure, y = Pathway_ord)) +
+  facet_grid(top_lab ~ ., scales = "free_y", space = "free_y") +   # no switch = "y"
+  geom_point(aes(color = FDR, size = Count), alpha = 1) +
+  scale_color_gradient(low = "#1B28B5", high = "lightblue") +  
+  scale_size(range = c(6, 8),
+  breaks = sort(unique(path2$Count))    # only integers will show
+)  +    # increase both min and max sizes
+  
+  ylab("") +
+  xlab("") +
+  theme_bw() +
+  theme(
+    # use strip text to show top pathway, on the right (default for row facets)
+    strip.text.y = element_text(size = 14, face = "bold", angle = 0),
+    strip.background = element_rect(
+    fill = "white",
+    colour = "black"      
+  ),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text  = element_text(size = 11),
+    axis.text.x  = element_text(size = 14, face = "bold"),
+    axis.text.y  = element_text(size = 14, face = "bold"),
+    axis.title   = element_text(size = 14, face = "bold"),
+    legend.position = "right",
+    legend.background = element_rect(
+      size = 0.5, linetype = "solid", colour = "#1B28B5"
+    ),
+    plot.margin = unit(c(0.5, 0.5, 1, 0.5), "cm")
+  ) +
+  guides(
+    color = guide_colorbar(order = 1),
+    size  = guide_legend(order = 2)
+  )
+gp_neg
+
+
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+
+top_mapping<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/pathway/top_mapping.xlsx")
+path_pos<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/paper1/reactome_pos_gm.xlsx") %>% mutate(direction=1)
+path_neg<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/paper1/reactome_neg_gm.xlsx") %>% mutate(direction=-1)
+
+
+
+path2 <- rbind(path_pos, path_neg) %>% 
+  filter(p.adjust < 0.05 & !exposure == "DEHP") %>% 
+  inner_join(top_mapping, by = "ID") %>%
+  mutate(
+    Pathway   = str_wrap(Description, width = 50),
+    FDR       = p.adjust*direction,
+    exposure  = factor(exposure,
+                       levels = c("MECPP","DEHP","MEOHP","MBZP",
+                                  "MEHHP","MEHP","MCPP","MEP","MIBP","MBP")),
+    top_lab   = str_wrap(coalesce(top_name, top_pathway), width = 20)
+  ) %>%
+  group_by(top_lab) %>%
+  mutate(Pathway_ord = fct_reorder(Pathway, FDR, .fun = min, .desc = TRUE)) %>%
+  ungroup()
+
+
+
+
+gp<- ggplot(path2, aes(x = exposure, y = Pathway_ord)) +
+  facet_grid(top_lab ~ ., scales = "free_y", space = "free_y") +   # no switch = "y"
+  geom_point(aes(color = FDR, size = Count), alpha = 1) +
+  scale_color_gradientn(
+  colors = c(
+    "lightblue",   # far negative
+    "#1B28B5",     # near-zero negative (dark blue)
+    "black",       # exactly zero (neutral)
+    "#BD260B",     # near-zero positive (dark red)
+    "pink"         # far positive
+  ),
+  values = scales::rescale(c(min(path2$FDR), min(path2$FDR)/100, 0, max(path2$FDR)/100, max(path2$FDR))),
+  name = "FDR*direction",
+  breaks = c(-0.02, -0.01, 0, 0.02, 0.04),
+  labels = c("-0.02", "-0.01", "0", "0.02", "0.04"),
+)+
+  scale_size(range = c(2, 10),
+  breaks = c(5, 10, 50, 90, 140))   +    # increase both min and max sizes
+  
+  ylab("") +
+  xlab("") +
+  theme_bw() +
+  theme(
+    # use strip text to show top pathway, on the right (default for row facets)
+    strip.text.y = element_text(size = 14, face = "bold", angle = 0),
+    strip.background = element_rect(
+    fill = "white",
+    colour = "black"      
+  ),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text  = element_text(size = 11),
+    axis.text.x  = element_text(size = 14, face = "bold"),
+    axis.text.y  = element_text(size = 14, face = "bold"),
+    axis.title   = element_text(size = 14, face = "bold"),
+    legend.position = "right",
+    legend.background = element_rect(
+      size = 0.5, linetype = "solid", colour = "black"
+    ),
+    plot.margin = unit(c(0.5, 0.5, 1, 0.5), "cm")
+  ) +
+  guides(
+    color = guide_colorbar(order = 1),
+    size  = guide_legend(order = 2)
+  )
+gp
+
+
+
+```
+
+```{r}
+
+setwd("/Users/meizhenyao/Documents/projects/proteomics_ht/result/paper1")
+
+jpeg(filename = "Figure2.jpg", width = 16, height = 20, units = "in", res = 300)
+
+gp
+
+dev.off()
+```

@@ -1,0 +1,2017 @@
+---
+title: "Model fitting"
+author: "Meizhen"
+date: "`r Sys.Date()`"
+abstract: |
+  Examine pairwise associations between exposures and whole protein biomarkers using linear regression
+  1. Adjusted for age, BMIAdjust race;
+  2. Applied inverse probability weighting to account for the nested case–control sampling;
+  3. Calculated FDR-adjusted p-values for multiple testing correction.
+format: 
+  html:
+    self-contained: true  # Ensures a single HTML file is created
+    code-fold: true
+    toc: true
+    toc-location: left
+theme: united
+number-sections: true
+editor: visual
+fig-width: 18
+fig-height: 12
+execute: 
+  warning: false
+---
+
+```{r, warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(ggpubr)
+library(data.table)
+library(readr)
+library(readxl)
+library(formattable)
+library(OlinkAnalyze)
+library(gtsummary)
+library(flextable)
+library(ggplotify)
+library(pheatmap)
+library(plotly)
+library(gapminder)
+library(manipulateWidget)
+library(ggfortify)
+library(reactable)
+library(mice)
+library(naniar)
+library(ggrepel)
+library(writexl)
+library(limma)
+library(qqman)
+library(clusterProfiler)
+library(enrichplot)
+library(ReactomePA)
+library(fgsea)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(mixOmics)
+library(sva)
+
+# setwd("/home/meizhen/proteomics/data")
+
+setwd("/Users/meizhenyao/Documents/projects/proteomics_ht/data")
+
+## import data (clean data - remove controls in sample and assay)
+data <- fread("intermediate/whole_scale_data.txt")
+
+## Proteins with <LOD% > 75%
+OlinkID_lod_remove75<- fread("intermediate/protein_lod_remove75.txt")$OlinkID
+
+
+chemical_name <- names(data %>% 
+                         dplyr::select(starts_with("pfas_"), starts_with("pth_") , starts_with("pah_") , starts_with("parab_") , starts_with("bis_") , starts_with("metal_") , -ends_with("_blod") ) )
+
+
+data_ready<-  data %>% 
+              mutate(ptb_type = case_when(ptb == 0 ~ "Not preterm birth",
+                                          ptb == 1 & ptb_spont == 1 ~ "Spontaneous preterm birth",
+                                          ptb == 1 & ptb_placental == 1 ~ "Placental preterm birth",
+                                          ptb == 1 & ptb_protocol == 1 ~ "Protocol preterm birth"),
+                     ptb_cat = factor(ptb, levels = c(0,1), labels = c("No", "Yes")),
+                     hispanic = factor(hispanic, levels = c(0,1), labels = c("No", "Yes")),
+                     race_recat = factor(ifelse(race == "Caucasian", "Caucasian", "Non-Caucasian"), levels = c("Caucasian", "Non-Caucasian")),
+                     parity_recat = factor(case_when(parity == 0 ~ "0",
+                                                     parity == 1 ~ "1",
+                                                     .default = ">1"), levels = c("0", "1", ">1")),
+                     mat_edu_recat = case_when(mat_edu_cat == 1 | mat_edu_cat == 2 ~ 1,
+                                               mat_edu_cat == 3 ~ 2,
+                                               .default = NULL)) %>% 
+              mutate(across(chemical_name, ~(log2(.x)), .names = '{col}_l'),
+                     weight = ifelse(ptb == 1, 1/(43/143), 1/(43/1038)),
+                     weight_scale = weight/mean(weight))
+
+
+
+```
+
+Without weights, but add preterm birth indicator as covariates.
+
+# With IPW
+
+## DEHP
+
+```{r, warning=FALSE, message=FALSE}
+protein<- setdiff(names(data_ready %>% dplyr::select(starts_with("OID"))),
+                  OlinkID_lod_remove75)
+
+expression<- t(data_ready %>% dplyr::select(protein))
+
+exposure<- names(data_ready %>% 
+                   dplyr::select(starts_with("pth") & ends_with("_SG_gm_l")))
+```
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_dehp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+dehp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_dehp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+dehp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_dehp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+dehp_value3<- lambda
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "DEHP"
+
+DEHP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MECPP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MECPP_gm_weight_sva_prolod.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MECPP
+
+```{r, warning=FALSE, message=FALSE}
+protein<- setdiff(names(data_ready %>% dplyr::select(starts_with("OID"))),
+                  OlinkID_lod_remove75)
+
+expression<- t(data_ready %>% dplyr::select(protein))
+
+exposure<- names(data_ready %>% 
+                   dplyr::select(starts_with("pth") & ends_with("_SG_gm_l")))
+```
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mecpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mecpp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mecpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat+ components$PC1 +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mecpp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mecpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mecpp_value3<- lambda
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MECPP"
+
+MECPP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MECPP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MECPP_gm_weight_sva_prolod.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MEOHP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_meohp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+meohp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_meohp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+meohp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_meohp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+meohp_value3<- lambda
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEOHP"
+
+MEOHP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MEOHP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEOHP_gm_weight_sva_prolod.csv')
+```
+
+Adjust surrogate variable 1
+
+## MEHP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mehp_value3<- lambda
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEHP"
+
+MEHP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MEHP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEHP_gm_weight_sva_prolod.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MEHHP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehhp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehhp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehhp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehhp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehhp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mehhp_value3<- lambda
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEHHP"
+
+MEHHP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MEHHP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEHHP_gm_weight_sva_prolod.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MBZP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbzp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbzp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbzp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbzp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbzp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mbzp_value3<- lambda
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MBzP"
+
+MBzP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MBzP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MBzP_gm_weight_sva_prolod.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MIBP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mibp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mibp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mibp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mibp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mibp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mibp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MiBP"
+
+MiBP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MiBP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MiBP_gm_weight_sva_prolod.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MBP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mbp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MBP"
+
+MBP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MBP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MBP_gm_weight_sva_prolod.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MEP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mep_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mep_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mep_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mep_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mep_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mep_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEP"
+
+MEP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MEP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEP_gm_weight_sva_prolod.csv')
+```
+
+Adjust surrogate variable 1
+
+## MCPP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mcpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mcpp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mcpp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mcpp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mcpp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat +data_ready$ptb_cat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mcpp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MCPP"
+
+MCPP_gm_weight_sva<- ss.hits.pv
+
+# write.csv(MCPP_gm_weight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MCPP_gm_weight_sva_prolod.csv')
+```
+
+Adjust surrogate variable 1
+
+## Summary
+
+```{r, warning=FALSE, message=FALSE}
+lambda_value<- c(mecpp_value1, mecpp_value2, mecpp_value3,
+                 meohp_value1, meohp_value2, meohp_value3,
+                 mehp_value1, mehp_value2, mehp_value3,
+                 mehhp_value1, mehhp_value2, mehhp_value3,
+                 mbzp_value1, mbzp_value2, mbzp_value3,
+                 mibp_value1, mibp_value2, mibp_value3,
+                 mbp_value1, mbp_value2, mbp_value3,
+                 mep_value1, mep_value2, mep_value3,
+                 mcpp_value1, mcpp_value2, mcpp_value3)
+
+lambda_model<- c('mecpp_value1', 'mecpp_value2', 'mecpp_value3',
+                 'meohp_value1', 'meohp_value2', 'meohp_value3',
+                 'mehp_value1', 'mehp_value2', 'mehp_value3',
+                 'mehhp_value1', 'mehhp_value2', 'mehhp_value3',
+                 'mbzp_value1', 'mbzp_value2', 'mbzp_value3',
+                 'mibp_value1', 'mibp_value2', 'mibp_value3',
+                 'mbp_value1', 'mbp_value2', 'mbp_value3',
+                 'mep_value1', 'mep_value2', 'mep_value3',
+                 'mcpp_value1', 'mcpp_value2', 'mcpp_value3')
+sva_value<- data.frame(lambda_model, 
+                       lambda_value) %>% 
+            mutate(exposure = factor(sub("_.*", "", lambda_model),
+                                     levels = c('mecpp','meohp', 'mehp','mehhp','mbzp','mibp','mbp','mep','mcpp')),
+                   model = sub(".*_", "", lambda_model))
+
+
+sva_plot <- ggplot(sva_value, aes(x = model, y = lambda_value, color = exposure, group = exposure)) +
+  geom_point(size = 6) +
+  geom_line(size = 2) +
+  geom_text(aes(label = round(lambda_value, 2)), vjust = -1, size = 10) +
+  facet_wrap(~ exposure, scales = "free_x") +
+  labs(x = "Model", y = "Lambda Value", title = "Lambda Values by Model for Each Phthalate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 20),
+        text = element_text(size = 20),
+        legend.position = "none")
+
+sva_plot
+```
+
+Model 1: Model 2: Adjust PC1 Model 3: Adjust surrogate variable 1
+
+# Without IPW
+
+## DEHP
+
+```{r, warning=FALSE, message=FALSE}
+protein<- setdiff(names(data_ready %>% dplyr::select(starts_with("OID"))),
+                  OlinkID_lod_remove75)
+
+expression<- t(data_ready %>% dplyr::select(protein))
+
+exposure<- names(data_ready %>% 
+                   dplyr::select(starts_with("pth") & ends_with("_SG_gm_l")))
+```
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_dehp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat + data_ready$mat_edu_recat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("λ = ", round(lambda,3)))
+dehp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_dehp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("λ = ", round(lambda,3)))
+dehp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+mod <- model.matrix(~ data_ready$pth_dehp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), adjust.method = "BY",sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("λ = ", round(lambda,3)))
+
+sum(ss.hits.pv$P.Val<0.05) 
+dehp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "DEHP"
+
+DEHP_gm_noweight_sva<- ss.hits.pv
+
+# write.csv(DEHP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/DEHP_gm_noweight_sva_prolod_ad.csv')
+# 
+```
+
+Adjust surrogate variable 1
+
+## MECPP
+
+```{r, warning=FALSE, message=FALSE}
+protein<- setdiff(names(data_ready %>% dplyr::select(starts_with("OID"))),
+                  OlinkID_lod_remove75)
+
+expression<- t(data_ready %>% dplyr::select(protein))
+
+exposure<- names(data_ready %>% 
+                   dplyr::select(starts_with("pth") & ends_with("_SG_gm_l")))
+```
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mecpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mecpp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mecpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat+ components$PC1)
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mecpp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mecpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat)
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), adjust.method = "BH",sort.by = "none") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+mecpp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MECPP"
+
+MECPP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MECPP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MECPP_gm_noweight_sva_prolod_ad.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MEOHP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_meohp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+meohp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_meohp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+meohp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_meohp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+
+sum(ss.hits.pv$P.Value<0.05) 
+meohp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEOHP"
+
+MEOHP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MEOHP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEOHP_gm_noweight_sva_prolod_ad.csv')
+```
+
+Adjust surrogate variable 1
+
+## MEHP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mehp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEHP"
+
+MEHP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MEHP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEHP_gm_noweight_sva_prolod_ad.csv')
+```
+
+Adjust surrogate variable 1
+
+## MEHHP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehhp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehhp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehhp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mehhp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mehhp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat  )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mehhp_value3<- lambda
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEHHP"
+
+MEHHP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MEHHP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEHHP_gm_noweight_sva_prolod_ad.csv')
+
+```
+
+Adjust surrogate variable 1
+
+## MBZP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbzp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbzp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbzp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbzp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbzp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat  )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mbzp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MBzP"
+
+MBzP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MBzP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MBzP_gm_noweight_sva_prolod_ad.csv')
+```
+
+Adjust surrogate variable 1
+
+## MIBP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mibp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mibp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mibp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mibp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mibp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mibp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MiBP"
+
+MiBP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MiBP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MiBP_gm_noweight_sva_prolod_ad.csv')
+```
+
+Adjust surrogate variable 1
+
+## MBP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mbp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+# summary(lm(pth_mbp_SG_gm_l ~ age + bmi_prepreg + race_recat, data = data_ready))
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mbp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg+ data_ready$race_recat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH") #, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mbp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MBP"
+
+MBP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MBP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MBP_gm_noweight_sva_prolod_ad.csv')
+```
+
+Adjust surrogate variable 1
+
+## MEP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mep_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mep_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mep_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mep_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mep_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")#, sort.by = "none"
+
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mep_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MEP"
+
+MEP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MEP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MEP_gm_noweight_sva_prolod_ad.csv')
+```
+
+Adjust surrogate variable 1
+
+## MCPP
+
+### Model 1
+
+```{r, warning=FALSE, message=FALSE}
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mcpp_SG_gm_l+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mcpp_value1<- lambda
+
+
+```
+
+### Model 2
+
+```{r, warning=FALSE, message=FALSE}
+pc <- pca(data_ready %>% dplyr::select(protein), ncomp = 10)
+pc$cum.var[10]
+components<- data.frame(pc$variates$X)
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mcpp_SG_gm_l+ components$PC1+ data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+out <- lmFit(expression,mod)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH")
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+mcpp_value2<- lambda
+
+
+```
+
+Adjust PC1
+
+### Model 3
+
+```{r, warning=FALSE, message=FALSE}
+
+
+weight_matrix<- matrix(rep(data_ready$weight, nrow(expression)),
+                             nrow = nrow(expression),
+                             byrow = TRUE)
+
+mod <- model.matrix(~ data_ready$pth_mcpp_SG_gm_l + data_ready$age + data_ready$bmi_prepreg + data_ready$race_recat )
+mod0 = model.matrix(~1,data=data_ready)
+
+n.sv = num.sv(expression,mod,method="leek")
+svobj = sva(expression,mod,mod0,n.sv=1)
+
+modSv = cbind(mod,svobj$sv)
+
+out <- lmFit(expression,modSv)
+out <- eBayes(out, trend = TRUE, robust = TRUE)
+ss.hits.pv <- topTable(out, coef=2, number=ncol(data_ready), sort.by = "none", adjust.method = "BH") #, sort.by = "none"
+
+
+lambda <- qchisq(median(ss.hits.pv$P.Value, na.rm=T), df = 1, lower.tail = F) / qchisq(0.5, 1)
+qqman::qq(ss.hits.pv$P.Value, main=paste0("Lambda = ", round(lambda,3)))
+
+
+sum(ss.hits.pv$adj.P.Val<0.2) 
+sum(ss.hits.pv$P.Value<0.05) 
+mcpp_value3<- lambda
+
+
+ss.hits.pv$Outcome<- rownames(ss.hits.pv)
+ss.hits.pv$Exposure<- "MCPP"
+
+MCPP_gm_noweight_sva<- ss.hits.pv
+
+write.csv(MCPP_gm_noweight_sva, '/Users/meizhenyao/Documents/projects/proteomics_ht/data/model/limma/MCPP_gm_noweight_sva_prolod_ad.csv')
+```
+
+Adjust surrogate variable 1
+
+## Summary
+
+```{r, warning=FALSE, message=FALSE}
+# lambda_value<- c(dehp_value1, dehp_value2, dehp_value3,
+#                  mecpp_value1, mecpp_value2, mecpp_value3,
+#                  meohp_value1, meohp_value2, meohp_value3,
+#                  mehp_value1, mehp_value2, mehp_value3,
+#                  mehhp_value1, mehhp_value2, mehhp_value3,
+#                  mbzp_value1, mbzp_value2, mbzp_value3,
+#                  mibp_value1, mibp_value2, mibp_value3,
+#                  mbp_value1, mbp_value2, mbp_value3,
+#                  mep_value1, mep_value2, mep_value3,
+#                  mcpp_value1, mcpp_value2, mcpp_value3)
+# 
+# lambda_model<- c('dehp_value1', 'dehp_value2', 'dehp_value3',
+#                  'mecpp_value1', 'mecpp_value2', 'mecpp_value3',
+#                  'meohp_value1', 'meohp_value2', 'meohp_value3',
+#                  'mehp_value1', 'mehp_value2', 'mehp_value3',
+#                  'mehhp_value1', 'mehhp_value2', 'mehhp_value3',
+#                  'mbzp_value1', 'mbzp_value2', 'mbzp_value3',
+#                  'mibp_value1', 'mibp_value2', 'mibp_value3',
+#                  'mbp_value1', 'mbp_value2', 'mbp_value3',
+#                  'mep_value1', 'mep_value2', 'mep_value3',
+#                  'mcpp_value1', 'mcpp_value2', 'mcpp_value3')
+
+lambda_value<- c(dehp_value1, dehp_value3,
+                 mecpp_value1, mecpp_value3,
+                 meohp_value1, meohp_value3,
+                 mehp_value1, mehp_value3,
+                 mehhp_value1, mehhp_value3,
+                 mbzp_value1, mbzp_value3,
+                 mibp_value1, mibp_value3,
+                 mbp_value1, mbp_value3,
+                 mep_value1, mep_value3,
+                 mcpp_value1, mcpp_value3)
+
+lambda_model<- c('dehp_value1', 'dehp_value2',
+                 'mecpp_value1', 'mecpp_value2',
+                 'meohp_value1', 'meohp_value2', 
+                 'mehp_value1', 'mehp_value2', 
+                 'mehhp_value1', 'mehhp_value2',
+                 'mbzp_value1', 'mbzp_value2', 
+                 'mibp_value1', 'mibp_value2', 
+                 'mbp_value1', 'mbp_value2',
+                 'mep_value1', 'mep_value2', 
+                 'mcpp_value1', 'mcpp_value2')
+
+sva_value<- data.frame(lambda_model, 
+                       lambda_value) %>% 
+            mutate(exposure = factor(toupper(sub("_.*", "", lambda_model)),
+                                     levels = toupper(c('dehp','mecpp','meohp', 'mehp','mehhp','mbzp','mibp','mbp','mep','mcpp'))),
+                   model = sub(".*_", "", lambda_model))
+
+
+sva_plot <- ggplot(sva_value, aes(x = model, y = lambda_value, color = exposure, group = exposure)) +
+  geom_point(size = 6) +
+  geom_line(size = 2) +
+  geom_text(aes(label = round(lambda_value, 2)), vjust = -1, size = 10) +
+  ylim(0, 8) +
+  facet_wrap(~ exposure, scales = "free_x") +
+  labs(x = "Model", y = "Lambda Value", title = "Lambda Values by Model for Each Phthalate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 20),
+        axis.title = element_text(colour = "black", face = "bold", size = 18),
+        text = element_text(size = 20),
+        legend.position = "none",
+        strip.text = element_text(colour = "black", face = "bold", size = 18))
+
+sva_plot
+```
+
+Model 1: Model 2: Adjust PC1 Model 3: Adjust surrogate variable 1

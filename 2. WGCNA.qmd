@@ -1,0 +1,720 @@
+---
+title: "Section2: WGCNA"
+author: "Meizhen"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    self-contained: true  # Ensures a single HTML file is created
+    code-fold: true
+    toc: true
+    toc-location: left
+theme: united
+number-sections: true
+editor: visual
+fig-width: 18
+fig-height: 12
+execute: 
+  warning: false
+---
+
+```{r, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(data.table)
+library(readr)
+library(readxl)
+library(formattable)
+library(OlinkAnalyze)
+library(gtsummary)
+library(flextable)
+library(ggplotify)
+library(pheatmap)
+library(plotly)
+library(gapminder)
+library(manipulateWidget)
+library(ggfortify)
+library(reactable)
+library(mice)
+library(naniar)
+library(ggrepel)
+library(writexl)
+library(plotly)
+library(OlinkAnalyze)
+library(clusterProfiler)
+library(ReactomePA)
+library(enrichplot)
+library(fgsea)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(mixOmics)
+library(circlize)
+library(WGCNA)
+library(ComplexHeatmap)
+
+setwd("/Users/meizhenyao/Documents/projects/proteomics_ht/data")
+
+data <- fread("intermediate/whole_inverserank_data.txt")
+assay_list<- read_excel("raw/proteins/olink-explore-ht-assay-list.xlsx")
+names(assay_list)[1]<- "protein"
+names(assay_list)[2]<- "UniProt_ID"
+names(assay_list)[3]<- "Protein_name"
+names(assay_list)[4]<- "Gene_name"
+
+
+## Proteins with <LOD% > 75%
+protein_lod_remove75<- fread("intermediate/protein_lod_remove75.txt")$Assay
+OlinkID_lod_remove75<- fread("intermediate/protein_lod_remove75.txt")$OlinkID
+
+chemical_name <- names(data %>% 
+                       dplyr::select(starts_with("pfas_"), starts_with("pth_") , starts_with("pah_") , starts_with("parab_") , starts_with("bis_") , starts_with("metal_") , -ends_with("_blod") ) )
+
+
+data_ready<-  data %>% 
+  mutate(ptb_type = case_when(ptb == 0 ~ "Not preterm birth",
+                              ptb == 1 & ptb_spont == 1 ~ "Spontaneous preterm birth",
+                              ptb == 1 & ptb_placental == 1 ~ "Placental preterm birth",
+                              ptb == 1 & ptb_protocol == 1 ~ "Protocol preterm birth"),
+         ptb_cat = factor(ptb, levels = c(0,1), labels = c("No", "Yes")),
+         hispanic = factor(hispanic, levels = c(0,1), labels = c("No", "Yes")),
+         race_recat = factor(ifelse(race == "Caucasian", "Caucasian", "Non-Caucasian"), levels = c("Caucasian", "Non-Caucasian")),
+         parity_recat = factor(case_when(parity == 0 ~ "0",
+                                         parity == 1 ~ "1",
+                                         .default = ">1"), levels = c("0", "1", ">1")),
+         ptb_spont_recat = case_when(ptb == 0 ~ 0,
+                                     ptb == 1 & ptb_spont == 1 ~ 1,
+                                     .default = NULL),
+         pe_recat = case_when(pe == 1 ~ 1,
+                               ptb == 0 & pe == 0 ~ 0,
+                               .default = NULL),
+         pe_el_recat = case_when(pe == 1 & pe_ga <= 34 ~ 1,
+                                 pe == 1 & pe_ga > 34 ~ 2,
+                                 ptb == 0 & pe == 0 ~ 0,
+                                 .default = NULL),
+         ptb_placental_recat = case_when(ptb == 0 ~ 0,
+                                         ptb == 1 & ptb_placental == 1 ~ 1,
+                                         .default = NULL),
+         pe_early_recat = case_when(pe_el_recat == 1 ~ 1,
+                                    pe_el_recat == 0 ~ 0,
+                                    .default = NULL),
+         pe_late_recat = case_when(pe_el_recat == 2 ~ 1,
+                                   pe_el_recat == 0 ~ 0,
+                                   .default = NULL),
+         ghtn_recat = case_when(ghtn == 1 ~ 1,
+                                ghtn == 0 & ptb == 0 & pe == 0 ~ 0,
+                                .default = NULL),
+         chtn_recat = case_when(chtn == 1 ~ 1,
+                                chtn == 0 & ptb == 0 & pe == 0 ~ 0,
+                                .default = NULL),
+         hispanic = factor(hispanic, levels = c(0,1), labels = c("No", "Yes")),
+         race_recat = factor(ifelse(race == "Caucasian", "Caucasian", "Non-Caucasian"), levels = c("Caucasian", "Non-Caucasian")),
+         parity_recat = factor(case_when(parity == 0 ~ "0",
+                                         parity == 1 ~ "1",
+                                         .default = ">1"), levels = c("0", "1", ">1")),
+         mat_edu_recat = case_when(mat_edu_cat == 1 | mat_edu_cat == 2 ~ 1,
+                                   mat_edu_cat == 3 ~ 2,
+                                   .default = NULL)) %>% 
+        mutate(across(chemical_name, ~(log2(.x)), .names = '{col}_l'),
+               weight = ifelse(ptb == 1, 1/(43/143), 1/(43/1038)))
+
+
+
+```
+
+# Part 2: individual phthalate and proteomics modules
+
+## WGCNA
+
+```{r, warning=FALSE, message=FALSE}
+
+## Proteins with <LOD% > 75%
+OlinkID_lod_remove75<- fread("/Users/meizhenyao/Documents/projects/proteomics_ht/data/intermediate/protein_lod_remove75.txt")$OlinkID
+
+protein<- setdiff(names(data_ready %>% dplyr::select(starts_with("OID"))),
+                  OlinkID_lod_remove75)
+
+## create matrix for analysis
+prot_mat<- as.matrix(data_ready %>% 
+           dplyr::select(protein))
+
+trait_df<- as.matrix(data_ready %>% 
+           dplyr::select(starts_with("pth_") & ends_with("_SG_gm_l")))
+
+
+stopifnot(identical(rownames(prot_mat), rownames(trait_df)))
+
+
+```
+
+### QC of proteins and samples outliers
+
+```{r}
+
+# WGCNA expects numeric matrix/data frame
+datExpr <- as.data.frame(prot_mat)
+
+# Check dimensions
+dim(datExpr)
+
+# Check protein outliers
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+summary(gsg)
+
+# Check sample outliers
+sampleTree <- hclust(dist(datExpr), method = "average")
+
+plot(sampleTree,
+     main = "Sample clustering to detect outliers",
+     sub = "",
+     xlab = "",
+     cex.lab = 1.2,
+     cex.axis = 1.2,
+     cex.main = 1.4)
+
+clust <- cutreeStatic(sampleTree,
+                      cutHeight = 120,
+                      minSize = 10)
+table(clust)
+```
+
+### Determine soft-threshold power
+
+```{r}
+check<- pickSoftThreshold(datExpr)
+
+
+powers <- c(1:20)
+
+sft <- pickSoftThreshold(
+  datExpr,
+  powerVector = powers,
+  networkType = "signed",   # often a good default for proteomics
+  corFnc = "bicor",
+  corOptions = list(use = "pairwise.complete.obs",
+                    maxPOutliers = 0.05,
+                    pearsonFallback = "individual"),
+  verbose = 5
+)
+
+# Inspect results
+print(sft$fitIndices)
+
+par(mfrow = c(1, 2))
+
+# Scale-free topology fit index
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n",
+     main = "Scale independence")
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers,
+     cex = 0.9)
+abline(h = 0.8, col = "red", lty = 2)
+
+# Mean connectivity
+plot(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     type = "n",
+     main = "Mean connectivity")
+text(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     labels = powers,
+     cex = 0.9)
+
+
+# Decision
+softPower<- 8
+# or 14
+
+```
+
+### Module detection
+
+```{r}
+set.seed(6325)
+net <- blockwiseModules(
+  datExpr,
+  power = softPower,
+  corType = "bicor",
+  maxPOutliers = 0.05,
+  pearsonFallback = "individual",
+  networkType = "signed",
+  TOMType = "signed",
+  deepSplit = 4,
+  minModuleSize = 20,
+  mergeCutHeight = 0.1,
+  minKMEtoStay = 0.15,
+  pamRespectsDendro = FALSE,
+  pamStage = TRUE,
+  numericLabels = FALSE,
+  saveTOMs = FALSE,
+  verbose = 3
+)
+
+moduleColors <- net$colors
+table(moduleColors)
+
+
+```
+
+### Module dendrogram and module color
+
+```{r}
+
+
+
+library(ggplotify)
+
+dendro_plot <- as.ggplot(function() {
+  plotDendroAndColors(
+    net$dendrograms[[1]],
+    moduleColors[net$blockGenes[[1]]],
+    "Module colors",
+    dendroLabels = FALSE,
+    hang = 0.03,
+    addGuide = TRUE,
+    guideHang = 0.05,
+    main = ""
+  )
+})
+
+proteinInfo <- data.frame(
+  protein = colnames(datExpr),
+  module = moduleColors,
+  stringsAsFactors = FALSE
+)
+# 
+# head(proteinInfo)
+```
+
+### Define module eigengene & define core proteins within each module
+
+```{r}
+MEs <- net$MEs
+MEs <- orderMEs(MEs)
+
+MM <- as.data.frame(cor(datExpr, MEs, use = "p"))
+blue_MM <- MM[moduleColors == "brown", "MEbrown"]
+
+summary(blue_MM)
+
+kMEtable <- as.data.frame(WGCNA::bicor(datExpr, MEs, use = "pairwise.complete.obs"))
+colnames(kMEtable) <- paste0("k", colnames(kMEtable))
+kMEtable$protein <- colnames(datExpr)
+kMEtable$moduleColor <- moduleColors
+
+
+# pivot KME into long format for easier handling
+kME_long <- kMEtable %>%
+  dplyr::select(protein, moduleColor, starts_with("kME")) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("kME"),
+    names_to = "module",
+    values_to = "KME"
+  ) %>%
+  mutate(module = gsub("kME", "", module)) %>%
+  filter(module == moduleColor)   # keep only matching module
+
+core_proteins <- kME_long %>%
+  group_by(module) %>%
+  arrange(desc(abs(KME)), .by_group = TRUE) %>%
+  slice_head(n = 300) %>%
+  ungroup()
+
+hub_proteins <- kME_long %>%
+  group_by(module) %>%
+  arrange(desc(abs(KME)), .by_group = TRUE) %>%
+  slice_head(n = 5) %>%
+  ungroup()%>% 
+  left_join(assay_list, by = "protein")
+
+
+# write.csv(hub_proteins, '~/Documents/projects/proteomics_ht/data/model/wgcna/wgcna_5.csv')
+```
+
+```{r}
+library(corrplot)
+
+corr_fun <- function(corr_mat) {
+  corrplot(corr_mat,
+           method = "color",
+           col = colorRampPalette(c("steelblue", "white", "darkred"))(100),
+           tl.pos = "tp",
+           tl.srt = 30,
+           tl.col = "black",
+           type = "upper",
+           order = "original",
+           sig.level = c(0.001, 0.01, 0.05),
+           insig = "label_sig",
+           pch.cex = 1.5,
+           pch.col = "black",
+           addrect = 2,
+           rect.col = "black",
+           rect.lwd = 2)
+
+}
+
+
+cordat <- as.matrix(cor(MEs, MEs, use = "all.obs"))
+corr_fun(cordat)
+
+
+
+```
+
+### Association between phthalates and groups
+
+```{r}
+
+##########################
+## function for model fit
+##########################
+
+lm_fit_info<- function(outcome, expo_names, covariates, weight_name, data, family){
+  
+  lm <- data.frame(Outcome = NA_character_, Exposure = NA_character_, Value = NA_real_, Std.Error = NA_real_, Lower.limit = NA_real_, Upper.limit = NA_real_, p.value = NA_real_)
+  
+  for(i in 1:length(outcome)){
+    
+    for (j in 1:length(expo_names)) {
+      
+      s_lm <- (glm(as.formula(paste0(outcome[i], "~", expo_names[j],  paste(covariates, collapse = " +"))), 
+                   weights=weight_name, 
+                   data = data,
+                   family = family))
+      
+      # robust vcov and inference
+      Vrob <- sandwich::vcovHC(s_lm, type = "HC3")
+      ct   <- lmtest::coeftest(s_lm, vcov. = Vrob)
+      ci   <- lmtest::coefci(s_lm, vcov. = Vrob)
+      
+      r.est <- cbind(
+        Estimate     = coef(s_lm),
+        Std.Error  = sqrt(diag(Vrob)),
+        lower_limit  = ci[, 1],
+        upper_limit  = ci[, 2],
+        p.value  = ct[, 4]
+      )
+      
+      lm <- rbind(lm, c(outcome[i], expo_names[j], as.numeric(r.est[2, c(1, 2, 3, 4, 5)])))
+    }
+    
+  }
+  
+  lm$Value <- as.numeric(lm$Value)
+  lm$Std.Error <- as.numeric(lm$Std.Error)
+  lm$Lower.limit <- as.numeric(lm$Lower.limit)
+  lm$Upper.limit <- as.numeric(lm$Upper.limit)
+  lm$p.value <- as.numeric(lm$p.value)
+  
+  lm = lm[-1,]  
+  
+}
+
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+
+module<- setdiff(names(MEs), "MEgrey")
+
+data_ready_module<- cbind(data_ready, MEs) %>% 
+                     mutate_at(all_of(module), ~ qnorm((rank(.) - 0.5) / sum(!is.na(.)))) 
+
+## GM
+exposure<- names(data_ready %>% 
+                 dplyr::select(starts_with("pth") & ends_with("_SG_gm_l") & -bis_bps_SG_gm_l & -pth_dehp_SG_gm_l))
+
+
+
+covariates_name<- c("+", "age", "bmi_prepreg", "race_recat")
+
+model<- lm_fit_info(module, exposure, covariates_name, weight_name = NULL, data_ready_module, "gaussian") 
+
+
+model_fit<- model %>%
+            group_by(Exposure) %>% 
+             mutate(p.adjust = p.adjust(p.value, method = "BH"),
+                      star = case_when(!is.na(p.value) & p.adjust < 0.1 ~ "**",
+                                       !is.na(p.value) & p.value < 0.05 ~ "*",
+                                       .default = ""),
+                     direction = ifelse(Value > 0, 1, -1),
+                     p.value_direction = p.value*direction)  %>% 
+             ungroup()
+
+
+
+model_fit$Exposure <- factor(model_fit$Exposure,
+                             levels = c("pth_mecpp_SG_gm_l",  "pth_meohp_SG_gm_l", "pth_mbzp_SG_gm_l",  "pth_mehhp_SG_gm_l", "pth_mehp_SG_gm_l",  "pth_mcpp_SG_gm_l",  "pth_mep_SG_gm_l",   "pth_mibp_SG_gm_l", "pth_mbp_SG_gm_l" ),
+                             labels = toupper(gsub("_SG_gm_l", "", gsub("pth_","",c("pth_mecpp_SG_gm_l",  "pth_meohp_SG_gm_l", "pth_mbzp_SG_gm_l",  "pth_mehhp_SG_gm_l", "pth_mehp_SG_gm_l",  "pth_mcpp_SG_gm_l",  "pth_mep_SG_gm_l",   "pth_mibp_SG_gm_l", "pth_mbp_SG_gm_l" )))))
+
+
+model_fit$Exposure<- factor(model_fit$Exposure,
+                       levels = rev(c("MECPP",  "MEOHP", "MBZP",  "MEHHP", "MEHP",  "MCPP",  "MEP",   "MIBP",  "MBP" )))
+
+model_fit$Outcome <-tools::toTitleCase(gsub("ME","",model_fit$Outcome))
+model_fit$Outcome <- factor(model_fit$Outcome,
+                              levels = (model_fit %>% distinct(Outcome) %>% arrange(Outcome))$Outcome)
+# write.csv(model_fit, '/Users/meizhenyao/Documents/projects/proteomics_ht/result/paper1/figure4_result.csv')
+
+
+figure1<- ggplot(model_fit, aes(x = fct_rev(Exposure), y = fct_rev(Outcome))) +
+  geom_tile(aes(fill = p.value_direction), color = "white", linewidth = 0.3) +
+  geom_text(aes(label = star), size = 10, color = "white", face = "bold") +
+  scale_y_discrete(position = "left") +
+  scale_x_discrete(position = "top") +
+  scale_fill_gradientn(
+  colors = c(
+    "lightblue",
+    "#1B28B5",
+    "black",
+    "#BD260B",
+    "pink"
+  ),
+  values = scales::rescale(c(
+    min(model_fit$p.value_direction, na.rm = TRUE),
+    -1e-3,   # small negative still blue
+    0,
+    1e-3,    # small positive already red
+    max(model_fit$p.value_direction, na.rm = TRUE)
+  )),
+  name = "P-value*direction"
+)+
+  labs(x = NULL, y = NULL,
+       caption = "* p<0.05; ** FDR<0.1") +  
+  guides(
+  fill = guide_colorbar(
+    barheight = unit(10, "cm"),
+    barwidth  = unit(0.5, "cm"),
+    title.position = "right",
+    title.theme = element_text(
+      angle = -90,
+      vjust = 0.5,   # center vertically
+      hjust = 0.5      # push downward)
+  )
+)) +
+  theme_bw(base_size = 15) +
+  theme(
+    # 4. WHITE BACKGROUND & BLACK BORDERS
+    panel.background = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    
+    # 5. STRIP (SIDEBAR) BORDERS
+    # This adds the black outline to the 'AA', 'LA', 'COX' etc. boxes
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 0.8),
+    strip.placement = "inside",
+    strip.text.y.left = element_text(angle = 0, color = "black", face = "bold"),
+    
+    # 6. SPACING & TEXT
+    panel.spacing.y = unit(0.3, "lines"), # Creates the visible gap between groups
+    panel.grid = element_blank(),
+    axis.text.y.right = element_text(hjust = 0, color = "black"),
+    axis.text.x.top = element_text(angle = 0),
+    legend.position = "right",
+    axis.text.y = element_text(
+      face = ifelse(levels(fct_rev(model_fit$Outcome)) %in% c("Black","Brown","Magenta", "Pink", "Turquoise"), "bold", "plain"),
+      size = ifelse(levels(fct_rev(model_fit$Outcome)) %in% c("Black","Brown","Magenta", "Pink", "Turquoise"), 15, 13),
+      color = case_when(levels(fct_rev(model_fit$Outcome)) == "Black" ~ "black",
+                        levels(fct_rev(model_fit$Outcome)) == "Brown" ~ "brown",
+                        levels(fct_rev(model_fit$Outcome)) == "Magenta" ~ "magenta",
+                        levels(fct_rev(model_fit$Outcome)) == "Pink" ~ "pink",
+                        levels(fct_rev(model_fit$Outcome)) == "Turquoise" ~ "turquoise",
+                        .default = "grey20"
+                        )
+    )
+  ) 
+
+figure1
+
+```
+
+### Label module: using enrichment analysis (REACTOME)
+
+```{r, warning=FALSE, message=FALSE}
+
+assay_list<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/raw/proteins/olink-explore-ht-assay-list.xlsx")
+names(assay_list)[1]<- "protein"
+names(assay_list)[2]<- "UniProt"
+names(assay_list)[3]<- "Protein_name"
+names(assay_list)[4]<- "Assay"
+
+
+protein_lod_remove75<- fread("/Users/meizhenyao/Documents/projects/proteomics_ht/data/intermediate/protein_lod_remove75.txt")
+names(protein_lod_remove75)[1]<- "Assay"
+names(protein_lod_remove75)[2]<- "OlinkID"
+names(protein_lod_remove75)[3]<- "UniProt"
+names(protein_lod_remove75)[4]<- "Protein_name"
+
+UniProt_list<- setdiff(assay_list$UniProt, protein_lod_remove75$UniProt)
+
+module_data<- core_proteins %>% 
+              left_join(assay_list, by = "protein")
+
+
+### reactome pathway function ####
+pathway_info<- function(universe_prot, expo_names, data){
+  
+  out_list <- vector("list", length(expo_names))
+  names(out_list) <- expo_names
+  
+  entrez_universe_ids <- mapIds(org.Hs.eg.db, keys = universe_prot, keytype = "UNIPROT", column = "ENTREZID")
+  entrez_universe_ids<- na.omit(entrez_universe_ids)
+  
+  for (i in 1:length(expo_names)) {
+    
+    input_data<- data %>% 
+      filter(module == expo_names[i]) 
+    
+    
+    uniprot_sig_name<- input_data$UniProt
+    entrez_ids <- mapIds(org.Hs.eg.db, keys = uniprot_sig_name, keytype = "UNIPROT", column = "ENTREZID")
+    entrez_ids<- na.omit(entrez_ids)
+    
+    
+    cluster_ora_results<- enrichPathway(gene=entrez_ids, 
+                                        universe=entrez_universe_ids,
+                                        organism = "human",
+                                        pvalueCutoff = 0.99, qvalueCutoff = 0.99,
+                                        readable=TRUE, 
+                                        pAdjustMethod = "BH")
+    
+    
+    res <- cluster_ora_results@result
+    if (is.null(res) || nrow(res) == 0) {
+      out_list[[i]] <- tibble::tibble()
+    } else {
+      out_list[[i]] <- dplyr::mutate(res, exposure = expo_names[i])
+    }
+  }
+  # bind all exposures, keep exposure column
+  final <- dplyr::bind_rows(out_list, .id = "ExposureName")
+  return(final)
+}
+
+
+
+#####################
+
+class <- unique(moduleColors)
+
+pathway<- pathway_info(UniProt_list, class, module_data)
+
+sig_pathway<- pathway %>%
+              filter(p.adjust<0.05)%>% 
+              filter(exposure %in% c("black", "brown", "magenta", "pink", "turquoise"))%>%
+              group_by(exposure) %>%
+              arrange(pvalue) %>%
+              slice_head(n = 5) %>%
+              ungroup()
+
+
+# sig_pathway<- pathway %>%
+#               group_by(exposure) %>%
+#               arrange(pvalue) %>% 
+#               slice_head(n = 5) %>% 
+#               filter(exposure %in% c("black", "brown", "magenta", "pink", "turquoise"))
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+
+top_mapping<- read_excel("/Users/meizhenyao/Documents/projects/proteomics_ht/data/pathway/top_mapping.xlsx")
+
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(forcats)
+
+path2 <- sig_pathway %>% 
+  inner_join(top_mapping, by = "ID") %>%
+  mutate(
+    Pathway   = str_wrap(Description, width = 45),
+    FDR       = p.adjust,
+    top_lab   = str_wrap(coalesce(top_name, top_pathway), width = 35)
+  ) 
+
+
+path2$exposure <-tools::toTitleCase(path2$exposure)
+path2$exposure <- factor(path2$exposure,
+                              levels = (path2 %>% distinct(exposure) %>% arrange(exposure))$exposure)
+
+gp<- ggplot(path2, aes(x = exposure, y = Pathway)) +
+  facet_grid(top_lab ~ ., scales = "free_y", space = "free_y") +   # no switch = "y"
+  geom_point(aes(color = FDR, size = Count), alpha = 1) +
+  scale_color_gradientn(
+  colors = c("black", "grey90"),
+  values = scales::rescale(c(min(path2$FDR, na.rm = TRUE),
+                             0.05))
+)+
+  scale_size(range = c(4, 8),
+  breaks = c(10, 20, 30)   # only integers will show
+)  + 
+  ylab("") +
+  xlab("") +
+  theme_bw() +
+  theme(
+    # use strip text to show top pathway, on the right (default for row facets)
+    strip.text.y = element_text(size = 16, face = "bold", angle = 0),
+    strip.background = element_rect(
+    fill = "white",
+    colour = "black"      
+  ),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text  = element_text(size = 14),
+    axis.text.y  = element_text(size = 16, face = "bold"),
+    axis.title   = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(size = 16, face = "bold",
+        color = case_when(levels(path2$exposure) == "Black" ~ "black",
+                          levels(path2$exposure) == "Brown" ~ "brown",
+                          levels(path2$exposure) == "Magenta" ~ "magenta",
+                          levels(path2$exposure) == "Pink" ~ "pink",
+                          levels(path2$exposure) == "Turquoise" ~ "turquoise",
+                          .default = "grey20"
+                          )),
+    legend.position = "right",
+    legend.background = element_rect(
+      size = 0.5, linetype = "solid", colour = "grey"
+    ),
+    plot.margin = unit(c(0.5, 0.5, 1, 0.5), "cm")
+  ) +
+  guides(
+    color = guide_colorbar(order = 1),
+    size  = guide_legend(order = 2)
+  )
+gp
+
+
+
+
+```
+
+### Figure 3
+```{r}
+
+setwd("/Users/meizhenyao/Documents/projects/proteomics_ht/result/paper1")
+
+jpeg(filename = "Figure3.jpg", width = 17, height = 20, units = "in", res = 300)
+
+
+p<- ggarrange(dendro_plot, figure1, 
+          nrow=1, ncol = 2, 
+          widths = c(1, 1), 
+          labels = c("A", "B"),
+          font.label = list(size = 20, color = "black", face = "bold", family = NULL)  
+          )
+
+ggarrange(p,gp,
+          nrow=2, ncol = 1, 
+          heights = c(0.5, 1), 
+          labels = c("", "C"),
+          font.label = list(size = 20, color = "black", face = "bold", family = NULL)  
+          )
+
+dev.off()
+```
